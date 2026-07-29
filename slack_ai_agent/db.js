@@ -198,3 +198,194 @@ class SlackAIAgent {
         return null;
     }
 
+
+    //analyze member with AI and return fit score, insights, and recommendations
+     async analyzeWithAI(memberInfo, researchData) {
+        //ai prompt template for analyzing new community members
+        const prompt = ChatPromptTemplate.fromTemplate(
+            `Analyze this new community member for fit with our commercial 
+    product.
+
+    Company: ${process.env.COMPANY_NAME || 'Your Company'}
+    Product: ${process.env.COMPANY_PRODUCT || 'Your Product'}
+
+    Member:
+    - Name: {name}
+    - Email: {email}
+    - Title: {title}
+
+    Research Data:
+    {research}
+
+    Provide a JSON response with:
+    - fitScore (0-100): likelihood they'd be interested in our product
+    - insights: array of 3-5 key observations
+    - recommendations: array of 2-4 engagement suggestions
+
+    Consider job title, company size, technical background, and budget 
+    authority.`
+        );
+
+
+        try {
+            const researchSummary = researchData.length > 0
+                ? researchData.map(r => `${r.title}: ${r.content}`).join(`\\n`)
+                : 'Limited research data available'
+
+            const chain = prompt.pipe(this.openai);
+            const result = await chain.invoke({
+                name: memberInfo.name,
+                email: memberInfo.email || 'Not provided',
+                title: memberInfo.title || 'not provided',
+                research: researchSummary
+            });
+
+            const responseText = result.content || result;
+
+            const cleanedResponse =
+                responseText.replace(/```json\n?|\n?```/g, '').trim()
+
+            const analysis = JSON.parse(cleanedResponse)
+
+            return {
+                fitScore: Math.max(0, Math.min(100, analysis.fitScore || 50)),
+                insights: Array.isArray(analysis.insights) ? analysis.insights : ['Analysis completed'],
+                recommendations: Array.isArray(analysis.recommendations) ? analysis.recommendations : ['Follow up recommended']
+            }
+
+        } catch (error) {
+            log.error('AI analysis error:', error.message);
+            return {
+                fitScore: 50,
+                insights: ['Unable to complete full analysis'],
+                recommendations: ['Manual review recommended']
+            }
+        }
+    }
+
+    //display the analysis in a Slack channel 
+     async postAnalysisToChannel(member, analysis, researchData) {
+        const color = analysis.fitScore >= 80 ? '#36a64f'
+            : analysis.fitScore >= 60 ? '#ffb84d'
+                : analysis.fitScore >= 40 ? '#ff9500' : '#ff4444';
+
+        const blocks = [
+            {
+                type: 'header',
+                text: { type: 'plain_text', text: `🔍 New Member: ${member.name}` }
+            },
+            {
+                type: 'section',
+                fields: [
+                    { type: 'mrkdwn', text: `*Fit Score:* ${analysis.fitScore}/100` },
+                    { type: 'mrkdwn', text: `*Email:* ${member.email || 'Not provided'}` },
+                    { type: 'mrkdwn', text: `*Title:* ${member.title || 'Not provided'}` },
+                ]
+            }
+        ];
+
+        if (analysis.insights.length > 0) {
+            blocks.push({
+                type: 'section',
+                text: {
+                    type: 'mrkdwn',
+                    text: `*Insights:*\n${analysis.insights.map(i =>
+                        `• ${i}`).join('\n')}`
+                }
+            })
+        }
+
+        if (analysis.recommendations.length > 0) {
+            blocks.push({
+                type: 'section',
+                text: {
+                    type: 'mrkdwn',
+                    text: `*Recommendations:*\n${analysis.recommendations.map(i =>
+                        `• ${i}`).join('\n')}`
+                }
+            });
+        }
+
+        blocks.push({
+            type: 'context',
+            elements: [
+                {
+                    type: 'mrkdwn',
+                    text: `📊 Analyzed: ${new Date().toISOString()}`
+                }
+            ]
+        });
+
+        await this.webClient.chat.postMessage({
+            channel: process.env.SLACK_PRIVATE_CHANNEL_ID,
+            text: `New Member Analysis: ${member.name} (${analysis.fitScore}/100)`,
+            attachments: [
+                {
+                    color: color,
+                    blocks: blocks
+                }
+            ]
+        });
+
+        log.info(`Analysis posted to channel for ${member.name}`)
+    }
+
+    //check if the email is a personal email
+    isPersonalEmail(email) {
+        const personalDomains = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'icloud.com'];
+        const domain = email.split('@')[1]?.toLowerCase();
+        return personalDomains.includes(domain);
+    }
+
+    async start() {
+        try {
+            log.info('🗄️ Initilazing database...')
+            await initDatabase()
+
+            const port = process.env.PORT || 3000;
+            this.server = this.app.listen(port, () => {
+                log.info(`🚀 Express server running on port ${port}`);
+            })
+
+            await this.slack.start();
+            log.info('⚡️ Slack bot connected');
+
+            log.info('🎉 Slack AI Agent is running!')
+
+            if (process.env.NODE_ENV === 'development') {
+                log.info(`Test endpoint: POST http://localhost:${port}/test/analyze-member`)
+            }
+
+        } catch (error) {
+            log.error('Failed to start:', error.message)
+            process.exit(1)
+        }
+    }
+
+    async stop() {
+        log.info('Shutting down...')
+        try {
+            await this.slack.stop()
+            if (this.server) {
+                await new Promise(resolve => this.server.close(resolve));
+            }
+            await closeDatabase();
+            log.info('Stopped successfully')
+        } catch (error) {
+            log.error('Shutdown error:', error.message)
+        }
+        process.exit(0)
+    }
+    
+
+const agent = new SlackAIAgent()
+
+process.on('SIGINT', () => agent.stop());
+process.on('SIGTERM', () => agent.stop());
+
+agent.start().catch(error => {
+    console.error('Startup failed:', error.message);
+    process.exit(1)
+})
+
+export default agent
